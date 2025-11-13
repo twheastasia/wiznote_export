@@ -257,7 +257,7 @@ class WizNoteAPIClient:
                 try:
                     result = response.json()
                     if isinstance(result, dict) and result.get('returnCode') == 200:
-                        return result.get('result')
+                        return result
                     return result
                 except Exception as e:
                     logger.error(f"解析笔记下载响应失败: {e}")
