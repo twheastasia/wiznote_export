@@ -22,6 +22,7 @@ from api_client import WizNoteAPIClient
 from storage import LocalStorage
 from downloader import NoteDownloader
 from converter import HTMLToMarkdownConverter
+from json_to_markdown import JsonToMarkdownConverter
 
 
 def setup_logging(config: dict):
@@ -161,6 +162,92 @@ def incremental_backup(downloader: NoteDownloader):
     downloader.download_all()
 
 
+def convert_all_json_to_markdown(docs_dir: str = 'docs', output_dir: str = 'outputs/md'):
+    """
+    批量转换所有 latest.json 文件为 Markdown 格式
+    
+    Args:
+        docs_dir: docs 目录路径
+        output_dir: 输出目录路径
+    """
+    logger = logging.getLogger(__name__)
+    docs_path = Path(docs_dir)
+    output_path = Path(output_dir)
+    
+    if not docs_path.exists():
+        logger.error(f"docs 目录不存在: {docs_dir}")
+        print(f"错误: docs 目录不存在: {docs_dir}")
+        return
+    
+    # 查找所有 latest.json 文件
+    json_files = list(docs_path.rglob('latest.json'))
+    
+    if not json_files:
+        logger.warning(f"在 {docs_dir} 目录下未找到任何 latest.json 文件")
+        print(f"警告: 在 {docs_dir} 目录下未找到任何 latest.json 文件")
+        return
+    
+    print(f"\n找到 {len(json_files)} 个 latest.json 文件")
+    print(f"输出目录: {output_path}")
+    print("开始转换...\n")
+    
+    # 创建转换器
+    converter = JsonToMarkdownConverter()
+    
+    # 统计
+    success_count = 0
+    fail_count = 0
+    
+    # 确保输出目录存在
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # 遍历转换
+    for i, json_file in enumerate(json_files, 1):
+        try:
+            # 构建相对路径用于显示
+            relative_path = json_file.relative_to(docs_path)
+            
+            # 使用父目录名作为文件名（更有意义）
+            # 例如: docs/xxx/yyy/zzz/latest.json -> zzz.md
+            parent_name = json_file.parent.name
+            
+            # 如果父目录名是 GUID 格式，尝试使用上级目录名
+            if len(parent_name) > 20 and '-' in parent_name:
+                # 尝试找一个更有意义的名字，或者使用序号
+                output_filename = f"document_{i:04d}.md"
+            else:
+                output_filename = f"{parent_name}.md"
+            
+            # 所有文件直接放在输出目录下
+            output_file = output_path / output_filename
+            
+            # 如果文件名冲突，添加序号
+            if output_file.exists():
+                output_filename = f"document_{i:04d}.md"
+                output_file = output_path / output_filename
+            
+            # 转换
+            print(f"[{i}/{len(json_files)}] 转换: {relative_path}")
+            
+            if converter.convert_file(str(json_file), str(output_file)):
+                success_count += 1
+                print(f"  ✓ 成功: {output_filename}")
+            else:
+                fail_count += 1
+                print(f"  ✗ 失败: {json_file}")
+                
+        except Exception as e:
+            fail_count += 1
+            logger.error(f"转换失败 {json_file}: {str(e)}")
+            print(f"  ✗ 失败: {json_file} - {str(e)}")
+    
+    # 输出统计
+    print("\n转换完成！")
+    print(f"成功: {success_count} 个")
+    print(f"失败: {fail_count} 个")
+    print(f"输出目录: {output_path.absolute()}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='为知笔记备份工具',
@@ -245,6 +332,24 @@ def main():
         help='重新登录'
     )
     
+    parser.add_argument(
+        '--convert-json',
+        action='store_true',
+        help='将所有 latest.json 文件转换为 Markdown 格式'
+    )
+    
+    parser.add_argument(
+        '--json-dir',
+        default='docs',
+        help='JSON 文件所在的 docs 目录 (默认: docs)'
+    )
+    
+    parser.add_argument(
+        '--md-output',
+        default='outputs/md',
+        help='Markdown 输出目录 (默认: outputs/md)'
+    )
+    
     args = parser.parse_args()
     
     # 加载配置
@@ -274,6 +379,11 @@ def main():
     # 设置日志
     setup_logging(config)
     logger = logging.getLogger(__name__)
+    
+    # 如果是 JSON 转换模式
+    if args.convert_json:
+        convert_all_json_to_markdown(args.json_dir, args.md_output)
+        return
     
     # 覆盖配置
     if args.output:

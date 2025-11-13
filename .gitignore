@@ -58,3 +58,4 @@ webapi-export/_metadata/
 # Test files
 webapi-export/test_output/
 webapi-export/tests/
+webapi-export/docs/
