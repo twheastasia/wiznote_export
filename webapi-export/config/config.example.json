@@ -30,6 +30,20 @@
         "preserve_structure": true,
         "add_metadata": false
     },
+    "websocket": {
+        "enabled": true,
+        "url_template": "wss://as.wiz.cn/editor/{kbGuid}/{docGuid}",
+        "origin": "https://as.wiz.cn",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "cookies": "",
+        "editor_token": "",
+        "additional_headers": {},
+        "init_payload": null,
+        "init_payload_encoding": "text",
+        "connect_timeout": 10,
+        "message_timeout": 10,
+        "skip_tls_verify": false
+    },
     "logging": {
         "level": "INFO",
         "log_file": "logs/wiznote_backup.log",

@@ -106,8 +106,27 @@ def interactive_login(config: dict) -> bool:
     return True
 
 
+def sanitize_filename(name: str, fallback: str = "untitled", max_length: int = 80) -> str:
+    """清理文件名中的非法字符"""
+    if not name:
+        name = fallback
+    invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+    for char in invalid_chars:
+        name = name.replace(char, '_')
+    name = name.strip() or fallback
+    return name[:max_length]
+
+
+# API选择逻辑已移除,现在优先使用WebSocket API,失败时自动降级到REST API
+
+
 def list_folders(api_client: WizNoteAPIClient):
-    """列出所有文件夹"""
+    """
+    列出所有文件夹
+    
+    Args:
+        api_client: API客户端
+    """
     print("\n您的文件夹列表：")
     print("-" * 50)
     
@@ -207,34 +226,43 @@ def convert_all_json_to_markdown(docs_dir: str = 'docs', output_dir: str = 'outp
             # 构建相对路径用于显示
             relative_path = json_file.relative_to(docs_path)
             
-            # 使用父目录名作为文件名（更有意义）
-            # 例如: docs/xxx/yyy/zzz/latest.json -> zzz.md
-            parent_name = json_file.parent.name
+            # 转换为 Markdown 内容
+            print(f"[{i}/{len(json_files)}] 转换: {relative_path}")
             
-            # 如果父目录名是 GUID 格式，尝试使用上级目录名
-            if len(parent_name) > 20 and '-' in parent_name:
-                # 尝试找一个更有意义的名字，或者使用序号
-                output_filename = f"document_{i:04d}.md"
-            else:
-                output_filename = f"{parent_name}.md"
+            markdown_content = converter.convert_to_content(str(json_file))
+            
+            if markdown_content is None:
+                fail_count += 1
+                print(f"  ✗ 失败: 无法读取或转换 {json_file}")
+                continue
+            
+            # 使用 Markdown 内容的前15个字符作为文件名
+            base_filename = converter.get_filename_from_content(markdown_content, max_length=15)
+            output_filename = f"{base_filename}.md"
             
             # 所有文件直接放在输出目录下
             output_file = output_path / output_filename
             
             # 如果文件名冲突，添加序号
-            if output_file.exists():
-                output_filename = f"document_{i:04d}.md"
+            counter = 1
+            while output_file.exists():
+                output_filename = f"{base_filename}_{counter}.md"
                 output_file = output_path / output_filename
+                counter += 1
             
-            # 转换
-            print(f"[{i}/{len(json_files)}] 转换: {relative_path}")
-            
-            if converter.convert_file(str(json_file), str(output_file)):
+            # 写入文件
+            try:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(markdown_content)
+                
                 success_count += 1
                 print(f"  ✓ 成功: {output_filename}")
-            else:
+                logger.info(f"成功转换: {json_file} -> {output_file}")
+                
+            except Exception as write_error:
                 fail_count += 1
-                print(f"  ✗ 失败: {json_file}")
+                logger.error(f"写入文件失败 {output_file}: {str(write_error)}")
+                print(f"  ✗ 失败: 无法写入 {output_filename}")
                 
         except Exception as e:
             fail_count += 1
@@ -246,6 +274,198 @@ def convert_all_json_to_markdown(docs_dir: str = 'docs', output_dir: str = 'outp
     print(f"成功: {success_count} 个")
     print(f"失败: {fail_count} 个")
     print(f"输出目录: {output_path.absolute()}")
+
+
+def export_notes_to_markdown(
+    api_client: WizNoteAPIClient,
+    output_dir: str,
+    folders_filter: Optional[List[str]] = None,
+):
+    """导出笔记为 Markdown
+    
+    优先使用 WebSocket API(新API)获取笔记,如果失败则自动降级到 REST API(旧API)
+    
+    Args:
+        api_client: API客户端
+        output_dir: 输出目录
+        folders_filter: 可选的文件夹过滤列表
+    """
+    # 检查WebSocket配置
+    ws_config = api_client.config.get('websocket', {})
+    websocket_available = ws_config.get('enabled', False)
+    if not websocket_available:
+        print("⚠ WebSocket API未启用,将仅使用 REST API")
+        print("提示: 在 config.json 中设置 websocket.enabled=true 可启用 WebSocket API")
+
+    converter = JsonToMarkdownConverter()
+    base_path = Path(output_dir)
+    base_path.mkdir(parents=True, exist_ok=True)
+
+    folders = api_client.get_all_folders()
+    if not folders:
+        print("未找到任何文件夹。")
+        return
+
+    def normalize_folder(folder_entry):
+        if isinstance(folder_entry, str):
+            return {
+                'path': folder_entry,
+                'name': folder_entry.strip('/').split('/')[-1] or 'Root'
+            }
+        return {
+            'path': folder_entry.get('path') or folder_entry.get('name') or '/',
+            'name': folder_entry.get('name') or folder_entry.get('path', 'Root')
+        }
+
+    normalized_folders = [normalize_folder(item) for item in folders]
+
+    if folders_filter:
+        filter_set = set(folders_filter)
+        normalized_folders = [folder for folder in normalized_folders if folder['path'] in filter_set]
+        if not normalized_folders:
+            print("未匹配到指定的文件夹，使用全部文件夹继续。")
+            normalized_folders = [normalize_folder(item) for item in folders]
+
+    total_notes = 0
+    success_notes = 0
+    failed_notes = 0
+    websocket_success = 0
+    rest_fallback_success = 0
+    conversion_failures = []  # 记录转换失败的笔记
+
+    print("\n开始导出笔记 (优先WebSocket API, 失败时自动降级REST API)...\n")
+
+    # 创建raw_json保存目录(用于保存WebSocket返回的原始数据)
+    raw_json_base = Path(output_dir + "_raw_json")
+    raw_json_base.mkdir(parents=True, exist_ok=True)
+    print(f"WebSocket原始JSON保存到: {raw_json_base.absolute()}\n")
+
+    for folder in sorted(normalized_folders, key=lambda f: f['path']):
+        folder_path = folder['path']
+        relative = folder_path.strip('/')
+        target_dir = base_path if not relative else base_path / Path(*[part for part in relative.split('/') if part])
+        target_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n处理文件夹: {folder_path}")
+
+        for note in api_client.get_all_notes_in_folder(folder_path):
+            total_notes += 1
+            doc_guid = note.get('docGuid')
+            title = note.get('title') or doc_guid or 'untitled'
+
+            print(f"  -> 获取笔记 {title} ({doc_guid})")
+            
+            markdown = None
+            used_api = None
+            
+            # 策略: 优先尝试WebSocket API
+            if websocket_available:
+                try:
+                    detail = api_client.get_note_detail_via_websocket(doc_guid)
+                    if detail:
+                        # 保存原始JSON
+                        raw_json_folder = raw_json_base / Path(*[part for part in relative.split('/') if part]) if relative else raw_json_base
+                        raw_json_folder.mkdir(parents=True, exist_ok=True)
+                        raw_json_file = raw_json_folder / (sanitize_filename(title, fallback=doc_guid or 'untitled') + '.json')
+                        try:
+                            import json
+                            with open(raw_json_file, 'w', encoding='utf-8') as f:
+                                json.dump(detail, f, ensure_ascii=False, indent=2)
+                        except Exception as json_exc:
+                            print(f"     ⚠ 保存原始JSON失败: {json_exc}")
+
+                        # 提取并转换数据
+                        note_data = detail.get('data') or detail
+                        if isinstance(note_data, dict) and 'blocks' not in note_data and 'data' in note_data:
+                            note_data = note_data['data']
+
+                        try:
+                            markdown = converter.convert(note_data)
+                            if markdown and markdown.strip():
+                                used_api = 'WebSocket'
+                                websocket_success += 1
+                                print("     ✓ WebSocket API成功")
+                        except Exception as conv_exc:
+                            print(f"     ⚠ WebSocket转换失败: {conv_exc}, 尝试REST API...")
+                except Exception as ws_exc:
+                    print(f"     ⚠ WebSocket获取失败: {ws_exc}, 尝试REST API...")
+            
+            # 降级: 如果WebSocket失败,尝试REST API
+            if not markdown or not markdown.strip():
+                try:
+                    note_content = api_client.download_note(doc_guid)
+                    if note_content:
+                        # 如果返回的是HTML,直接使用或转换
+                        if isinstance(note_content, dict) and 'html' in note_content:
+                            html_content = note_content['html']
+                        else:
+                            html_content = str(note_content)
+                        
+                        try:
+                            html_converter = HTMLToMarkdownConverter(api_client.config)
+                            markdown = html_converter.convert(html_content)
+                            if markdown and markdown.strip():
+                                used_api = 'REST'
+                                rest_fallback_success += 1
+                                print("     ✓ REST API降级成功")
+                        except Exception as conv_exc:
+                            print(f"     ✗ REST API转换失败: {conv_exc}")
+                except Exception as rest_exc:
+                    print(f"     ✗ REST API获取失败: {rest_exc}")
+            
+            # 检查最终结果
+            if not markdown or not markdown.strip():
+                failed_notes += 1
+                conversion_failures.append({
+                    'doc_guid': doc_guid,
+                    'title': title,
+                    'folder': folder_path,
+                    'error': '所有API均失败或转换结果为空',
+                    'timestamp': datetime.now().isoformat()
+                })
+                print("     ✗ 所有API均失败")
+                continue
+            
+            # 写入Markdown文件
+            filename = sanitize_filename(title, fallback=doc_guid or 'untitled') + '.md'
+            output_file = target_dir / filename
+            try:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(markdown)
+                success_notes += 1
+                print(f"     ✓ 已导出: {output_file.name} (via {used_api})")
+            except Exception as exc:
+                failed_notes += 1
+                conversion_failures.append({
+                    'doc_guid': doc_guid,
+                    'title': title,
+                    'folder': folder_path,
+                    'error': f'写入Markdown文件失败: {str(exc)}',
+                    'timestamp': datetime.now().isoformat()
+                })
+                print(f"     ✗ 写入文件失败: {exc}")
+
+    # 保存转换失败记录
+    if conversion_failures:
+        failure_log_path = Path(output_dir) / 'conversion_failures.json'
+        try:
+            import json
+            with open(failure_log_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'total_failures': len(conversion_failures),
+                    'strategy': 'WebSocket优先, REST降级',
+                    'export_time': datetime.now().isoformat(),
+                    'failures': conversion_failures
+                }, f, ensure_ascii=False, indent=2)
+            print(f"\n⚠ 转换失败记录已保存到: {failure_log_path.absolute()}")
+        except Exception as log_exc:
+            print(f"\n⚠ 保存失败记录时出错: {log_exc}")
+
+    print("\n导出完成！")
+    print(f"总笔记: {total_notes}")
+    print(f"成功: {success_notes} (WebSocket: {websocket_success}, REST降级: {rest_fallback_success})")
+    print(f"失败: {failed_notes}")
+    print(f"输出目录: {Path(output_dir).absolute()}")
+    print(f"原始JSON目录: {raw_json_base.absolute()}")
 
 
 def main():
@@ -265,6 +485,12 @@ def main():
   
   # 列出所有文件夹
   python main.py --list
+  
+  # 导出笔记为Markdown(优先WebSocket,失败时自动降级REST)
+  python main.py --export-md
+  
+  # 转换JSON为Markdown
+  python main.py --convert-json
   
   # 增量备份
   python main.py --incremental
@@ -348,6 +574,18 @@ def main():
         '--md-output',
         default='outputs/md',
         help='Markdown 输出目录 (默认: outputs/md)'
+    )
+
+    parser.add_argument(
+        '--export-md',
+        action='store_true',
+        help='导出笔记为 Markdown 格式'
+    )
+
+    parser.add_argument(
+        '--export-output',
+        default='outputs/markdown',
+        help='Markdown 导出目录 (默认: outputs/markdown)'
     )
     
     args = parser.parse_args()
@@ -439,6 +677,13 @@ def main():
     # 创建API客户端
     api_client = WizNoteAPIClient(auth, config)
     
+    if args.export_md:
+        export_notes_to_markdown(
+            api_client,
+            args.export_output,
+        )
+        return
+
     # 列出文件夹
     if args.list:
         list_folders(api_client)
@@ -461,22 +706,36 @@ def main():
     
     # 执行备份
     if args.folders:
-        backup_specific_folders(downloader, args.folders)
-    elif args.all or args.incremental:
-        backup_all(downloader)
+        export_notes_to_markdown(
+            api_client,
+            config['download']['output_dir'],
+            folders_filter=args.folders,
+        )
+        return
+    if args.all:
+        export_notes_to_markdown(
+            api_client,
+            config['download']['output_dir'],
+        )
+        return
+    if args.incremental:
+        print("增量备份功能已弃用，请使用 --all 或 --folders")
+        return
     else:
         # 交互式选择
         print("\n请选择操作：")
         print("1. 备份所有笔记")
         print("2. 备份指定文件夹")
         print("3. 列出所有文件夹")
-        print("4. 增量备份")
         print("0. 退出")
         
-        choice = input("\n请输入选项 (0-4): ").strip()
+        choice = input("\n请输入选项 (0-3): ").strip()
         
         if choice == '1':
-            backup_all(downloader)
+            export_notes_to_markdown(
+                api_client,
+                config['download']['output_dir'],
+            )
         elif choice == '2':
             folders = api_client.get_all_folders()
             if not folders:
@@ -495,14 +754,15 @@ def main():
                 indices = [int(x) - 1 for x in selected.split()]
                 selected_folders = [folders[i] for i in indices if 0 <= i < len(folders)]
                 if selected_folders:
-                    backup_specific_folders(downloader, selected_folders)
+                    export_notes_to_markdown(
+                        api_client,
+                        config['download']['output_dir'],
+                        folders_filter=selected_folders,
+                    )
                 else:
                     print("未选择有效的文件夹。")
         elif choice == '3':
             list_folders(api_client)
-        elif choice == '4':
-            config['sync']['incremental'] = True
-            incremental_backup(downloader)
         elif choice == '0':
             print("退出程序。")
             return

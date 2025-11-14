@@ -54,6 +54,76 @@ class JsonToMarkdownConverter:
             logger.error(f"转换失败 {json_path}: {str(e)}")
             return False
     
+    def convert_to_content(self, json_path: str) -> Optional[str]:
+        """
+        转换 JSON 文件为 Markdown 内容（不写入文件）
+        
+        Args:
+            json_path: 输入的 JSON 文件路径
+            
+        Returns:
+            str: Markdown 内容，失败时返回 None
+        """
+        try:
+            # 读取 JSON 文件
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # 转换为 Markdown
+            markdown_content = self.convert(data)
+            return markdown_content
+            
+        except Exception as e:
+            logger.error(f"转换失败 {json_path}: {str(e)}")
+            return None
+    
+    @staticmethod
+    def get_filename_from_content(content: str, max_length: int = 15) -> str:
+        """
+        从 Markdown 内容中提取文件名（使用前N个字符）
+        
+        Args:
+            content: Markdown 内容
+            max_length: 最大字符数，默认15
+            
+        Returns:
+            str: 文件名（不含扩展名）
+        """
+        if not content:
+            return "untitled"
+        
+        # 移除前导空白
+        content = content.strip()
+        
+        # 如果以标题开头，去掉 # 符号
+        if content.startswith('#'):
+            content = content.lstrip('#').strip()
+        
+        # 获取第一行
+        first_line = content.split('\n')[0].strip()
+        
+        # 如果第一行为空，尝试获取第二行
+        if not first_line:
+            lines = [line.strip() for line in content.split('\n') if line.strip()]
+            first_line = lines[0] if lines else "untitled"
+        
+        # 截取前 max_length 个字符
+        filename = first_line[:max_length]
+        
+        # 移除文件名中的非法字符
+        invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\n', '\r', '\t']
+        for char in invalid_chars:
+            filename = filename.replace(char, '_')
+        
+        # 去掉前后空格
+        filename = filename.strip()
+        
+        # 如果结果为空，使用默认名称
+        if not filename:
+            filename = "untitled"
+        
+        return filename
+    
     def convert(self, data: Dict[str, Any]) -> str:
         """
         将 JSON 数据转换为 Markdown 文本

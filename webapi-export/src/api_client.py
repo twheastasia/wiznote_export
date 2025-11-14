@@ -8,12 +8,14 @@
 import os
 import json
 import time
+import ssl
+import base64
 import requests
-from typing import Dict, List, Optional, Generator
+from typing import Dict, List, Optional, Generator, Any
 from functools import wraps
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
-from urllib.parse import quote
+import websocket
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +118,7 @@ class WizNoteAPIClient:
         if response.status_code == 200:
             try:
                 result = response.json()
+                logger.info(f"文件夹响应: {result}")
                 if isinstance(result, list):
                     logger.info(f"获取到 {len(result)} 个文件夹")
                     return result
@@ -274,6 +277,227 @@ class WizNoteAPIClient:
         
         return None
     
+    def get_editor_token_info(self, doc_guid: str) -> Optional[Dict]:
+        """获取编辑器 WebSocket token 信息
+        
+        通过 POST /ks/note/{kbGuid}/{docGuid}/tokens 获取编辑器专用信息
+        返回包含 editorToken, editorPermission, userId, displayName, avatarUrl 等信息
+        """
+        endpoint = f'/ks/note/{self.kb_guid}/{doc_guid}/tokens'
+        
+        try:
+            response = self.request('POST', endpoint)
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, dict) and result.get('returnCode') == 200:
+                    editor_info = result.get('result', {})
+                    if editor_info.get('editorToken'):
+                        logger.debug(f"成功获取编辑器 token 信息")
+                        return editor_info
+                    else:
+                        logger.warning(f"响应中没有 editorToken: {result}")
+                else:
+                    logger.warning(f"获取编辑器 token 失败: {result}")
+        except Exception as e:
+            logger.error(f"获取编辑器 token 异常: {e}")
+        
+        return None
+
+    def get_note_detail_via_websocket(self, doc_guid: str) -> Optional[Dict]:
+        """通过 WebSocket 获取笔记 JSON 详情"""
+        ws_config = self.config.get('websocket', {})
+        if not ws_config.get('enabled'):
+            logger.warning("WebSocket 功能未启用，请在配置中设置 websocket.enabled 为 true")
+            return None
+
+        url_template = ws_config.get('url_template') or "wss://wiz.frp.linyanli.cn/editor/{kbGuid}/{docGuid}"
+        ws_url = url_template.format(kbGuid=self.kb_guid, docGuid=doc_guid)
+        logger.debug(f"WebSocket URL: {ws_url}")
+        
+        # 获取编辑器信息
+        # 优先使用配置中的 editor_token
+        editor_token_config = ws_config.get('editor_token', '').strip()
+        if editor_token_config:
+            logger.debug(f"使用配置中的 editor_token: {editor_token_config[:20]}...")
+            token = editor_token_config
+            # 使用已有的用户信息
+            user_id = self.auth.user_guid
+            display_name = self.auth.username
+            avatar_url = f"{self.kb_server}/as/user/avatar/{self.auth.user_guid}"
+            permission = "w"
+        else:
+            # 通过 API 获取编辑器信息
+            logger.debug("从 API 获取编辑器 token 信息...")
+            editor_info = self.get_editor_token_info(doc_guid)
+            if not editor_info:
+                logger.error("无法获取编辑器 token 信息")
+                return None
+            
+            token = editor_info.get('editorToken')
+            user_id = editor_info.get('userId')
+            display_name = editor_info.get('displayName')
+            avatar_url = editor_info.get('avatarUrl')
+            permission = editor_info.get('editorPermission', 'w')
+            
+            if not token:
+                logger.error("编辑器信息中没有 token")
+                return None
+            
+            logger.debug(f"获取到 editor token: {token[:20]}...")
+        
+        headers = {
+            "Origin": ws_config.get('origin', self.kb_server),
+            "User-Agent": ws_config.get('user_agent', 'WizNote-Team-Backup/1.0'),
+        }
+        
+        # 同时也在请求头中添加 token
+        if token:
+            headers['X-Wiz-Token'] = token
+
+        cookies = ws_config.get('cookies')
+        if cookies:
+            headers["Cookie"] = cookies
+            logger.debug(f"使用 Cookie: {cookies[:50]}..." if len(cookies) > 50 else f"使用 Cookie: {cookies}")
+
+        additional = ws_config.get('additional_headers') or {}
+        for key, value in additional.items():
+            if value:
+                headers[key] = value
+
+        header_list = [f"{key}: {value}" for key, value in headers.items() if value]
+
+        sslopt = {}
+        if ws_config.get('skip_tls_verify'):
+            sslopt = {"cert_reqs": ssl.CERT_NONE}
+
+        try:
+            logger.debug(f"正在连接 WebSocket: {ws_url}")
+            ws = websocket.create_connection(
+                ws_url,
+                header=header_list,
+                timeout=ws_config.get('connect_timeout', 10),
+                sslopt=sslopt or None,
+            )
+            logger.debug("WebSocket 连接成功")
+        except Exception as e:
+            logger.error(f"建立 WebSocket 连接失败: {e}")
+            return None
+
+        # 准备握手消息
+        handshake_msg = {
+            "a": "hs",
+            "id": None,
+            "auth": {
+                "appId": self.kb_guid,
+                "userId": user_id,
+                "displayName": display_name,
+                "avatarUrl": avatar_url,
+                "docId": doc_guid,
+                "token": token,
+                "permission": permission
+            }
+        }
+        
+        # 连接后立即发送第一次握手
+        logger.debug(f"发送第一次握手消息 (token: {token[:20]}...)")
+        ws.send(json.dumps(handshake_msg))
+
+        init_payload = ws_config.get('init_payload')
+        if init_payload:
+            encoding = (ws_config.get('init_payload_encoding') or 'text').lower()
+            payload_bytes: Optional[bytes] = None
+            if encoding == 'hex':
+                try:
+                    payload_bytes = bytes.fromhex(init_payload.replace(' ', ''))
+                    logger.debug(f"发送 hex init_payload: {len(payload_bytes)} bytes")
+                except ValueError as exc:
+                    logger.error(f"init_payload hex 解析失败: {exc}")
+            elif encoding == 'base64':
+                try:
+                    payload_bytes = base64.b64decode(init_payload)
+                    logger.debug(f"发送 base64 init_payload: {len(payload_bytes)} bytes")
+                except Exception as exc:
+                    logger.error(f"init_payload base64 解析失败: {exc}")
+            if payload_bytes is not None:
+                ws.send(payload_bytes, opcode=websocket.ABNF.OPCODE_BINARY)
+            else:
+                logger.debug(f"发送 text init_payload: {init_payload[:100]}...")
+                ws.send(init_payload)
+
+        ws.settimeout(ws_config.get('message_timeout', 10))
+
+        note_payload: Optional[Dict[str, Any]] = None
+        message_count = 0
+        session_id = None
+        handshake_sent = False  # 标记是否已发送握手
+        
+        try:
+            while True:
+                try:
+                    message = ws.recv()
+                    message_count += 1
+                except websocket.WebSocketTimeoutException:
+                    logger.debug(f"WebSocket 超时，共接收 {message_count} 条消息")
+                    break
+                except websocket.WebSocketConnectionClosedException:
+                    logger.debug(f"WebSocket 连接关闭，共接收 {message_count} 条消息")
+                    break
+
+                if not message:
+                    continue
+
+                if isinstance(message, bytes):
+                    try:
+                        message = message.decode('utf-8')
+                    except UnicodeDecodeError:
+                        logger.debug(f"消息 #{message_count}: 无法解码的二进制数据")
+                        continue
+
+                try:
+                    payload = json.loads(message)
+                    logger.debug(f"消息 #{message_count}: {json.dumps(payload, ensure_ascii=False)[:200]}...")
+                except json.JSONDecodeError:
+                    logger.debug(f"消息 #{message_count}: 非JSON数据: {message[:200]}...")
+                    continue
+
+                # 记录所有消息类型
+                msg_type = payload.get('a')
+                logger.debug(f"消息类型: {msg_type}")
+
+                # 收到 init 消息后,再次发送握手
+                if msg_type == 'init' and not handshake_sent:
+                    session_id = payload.get('id')
+                    logger.debug(f"收到 init 消息，session_id: {session_id}")
+                    logger.debug(f"发送第二次握手消息: {json.dumps({**handshake_msg, 'auth': {**handshake_msg['auth'], 'token': token[:20] + '...'}}, ensure_ascii=False)}")
+                    ws.send(json.dumps(handshake_msg))
+                    handshake_sent = True
+                    continue
+
+                # 处理握手响应消息
+                if msg_type == 'hs':
+                    logger.debug("收到握手响应")
+                    
+                    # 发送获取文档数据的请求
+                    f_request = {"a": "f", "c": self.kb_guid, "d": doc_guid}
+                    logger.debug(f"发送 f 请求获取文档数据: {json.dumps(f_request, ensure_ascii=False)}")
+                    ws.send(json.dumps(f_request))
+                    continue
+
+                # 处理文档数据消息
+                if msg_type == 'f' and 'data' in payload:
+                    note_payload = payload.get('data')
+                    logger.info(f"成功获取笔记数据 (消息 #{message_count})")
+                    break
+        finally:
+            ws.close()
+            logger.debug(f"WebSocket 连接已关闭，共处理 {message_count} 条消息")
+
+        if note_payload is None:
+            logger.warning(f"未通过 WebSocket 获取到笔记数据: {doc_guid} (共接收 {message_count} 条消息)")
+            return None
+
+        return note_payload
+    
     def get_note_html(self, doc_guid: str) -> Optional[str]:
         """获取笔记的HTML内容"""
         note_data = self.download_note(doc_guid, download_info=False, download_data=True)
@@ -381,7 +605,7 @@ if __name__ == "__main__":
                     print(f"文件夹列表 (前5个): {[f.get('name', str(f)) for f in folders[:5]]}")
                 
                 # 获取根目录的笔记
-                print(f"\n获取根目录中的笔记...")
+                print("\n获取根目录中的笔记...")
                 notes_result = client.get_notes_in_folder("/", count=5)
                 notes = notes_result['notes']
                 if notes:
